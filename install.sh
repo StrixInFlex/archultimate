@@ -1,118 +1,143 @@
 #!/bin/bash
 
-# ===== CONFIGURATION =====
-TARGET_DISK="/dev/sda"       # Using /dev/sda instead of nvme
-HOSTNAME="archdolphin"
-USERNAME="dolphin"
-USER_PASSWORD="1234"         # CHANGE THIS
-ROOT_PASSWORD="1234"         # CHANGE THIS
-TIMEZONE="America/New_York"
-LOCALE="en_US.UTF-8"
+# -----------------------------------------------------------------------------
+# ARCH LINUX ADVANCED INSTALLER WITH TUI
+# -----------------------------------------------------------------------------
+
+# Configuration variables
+TARGET_DISK="/dev/sda"
+HOSTNAME="strixarch"
+USERNAME="strix"
+ROOT_PASSWORD="strixed"
+USER_PASSWORD="strix"
+TIMEZONE="Riyadh"
 KEYMAP="us"
+LOCALE="en_US.UTF-8"
 
 # Partition sizes
-ROOT_SIZE="55GiB"   # ext4 root partition
-SWAP_SIZE="4GiB"    # swap partition
-EFI_SIZE="1022MiB"  # EFI system partition
+ROOT_SIZE="55GiB"
+SWAP_SIZE="4GiB"
+EFI_SIZE="1022MiB"
 
-# ===== COLORS =====
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Colors
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+NC=$(tput sgr0)
 
-# ===== SAFETY CHECK =====
-echo -e "${YELLOW}WARNING: THIS WILL ERASE ALL DATA ON ${TARGET_DISK}!${NC}"
-lsblk
-read -p "Continue installation? (y/N): " confirm
-if [[ ! $confirm =~ ^[Yy]$ ]]; then
-    echo -e "${RED}Installation cancelled.${NC}"
-    exit 1
-fi
+# -----------------------------------------------------------------------------
+# TUI FUNCTIONS
+# -----------------------------------------------------------------------------
 
-# ===== HELPER FUNCTIONS =====
-info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+show_main_menu() {
+    dialog --backtitle "Arch Linux Installer" \
+           --title "Main Menu" \
+           --menu "Choose an option:" 15 50 5 \
+           1 "Automatic Installation (Recommended)" \
+           2 "Manual Partitioning" \
+           3 "Configure System" \
+           4 "Exit" 2> /tmp/choice
+    return $?
+}
 
-# ===== PHASE 1: PARTITIONING =====
-info "Partitioning ${TARGET_DISK}..."
-parted -s ${TARGET_DISK} mklabel gpt || error "Failed to create GPT table"
-parted -s ${TARGET_DISK} mkpart primary ext4 1MiB ${ROOT_SIZE} || error "Failed to create root partition"
-parted -s ${TARGET_DISK} mkpart primary linux-swap ${ROOT_SIZE} 59GiB || error "Failed to create swap"
-parted -s ${TARGET_DISK} mkpart primary fat32 59GiB 60GiB || error "Failed to create EFI partition"
-parted -s ${TARGET_DISK} set 3 esp on || error "Failed to set ESP flag"
+show_disk_selection() {
+    lsblk -d -n -l -o NAME,SIZE | awk '{print $1 " \"" $2 "\""}' > /tmp/disks
+    dialog --backtitle "Arch Linux Installer" \
+           --title "Select Installation Disk" \
+           --menu "Choose target disk:" 15 50 4 \
+           $(cat /tmp/disks) 2> /tmp/selected_disk
+    TARGET_DISK="/dev/$(cat /tmp/selected_disk)"
+}
 
-info "Formatting partitions..."
-mkfs.ext4 ${TARGET_DISK}1 || error "Failed to format root partition"
-mkswap ${TARGET_DISK}2 || error "Failed to format swap"
-mkfs.fat -F32 ${TARGET_DISK}3 || error "Failed to format EFI partition"
+show_password_dialog() {
+    dialog --backtitle "Arch Linux Installer" \
+           --title "$1" \
+           --passwordbox "Enter password:" 8 50 2> /tmp/password
+    echo $(cat /tmp/password)
+}
 
-info "Mounting filesystems..."
-mount ${TARGET_DISK}1 /mnt || error "Failed to mount root"
-mkdir -p /mnt/boot || error "Failed to create boot directory"
-mount ${TARGET_DISK}3 /mnt/boot || error "Failed to mount EFI partition"
-swapon ${TARGET_DISK}2 || error "Failed to enable swap"
+show_progress() {
+    dialog --backtitle "Arch Linux Installer" \
+           --title "$1" \
+           --gauge "$2" 8 50 0
+}
 
-# ===== PHASE 2: BASE SYSTEM INSTALL =====
-info "Optimizing package mirrors..."
-pacman -Sy --noconfirm reflector || warn "Mirror update failed, continuing with defaults"
-reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+# -----------------------------------------------------------------------------
+# INSTALLATION FUNCTIONS
+# -----------------------------------------------------------------------------
 
-info "Installing base system..."
-pacstrap /mnt base linux linux-firmware sof-firmware \
-    nano networkmanager grub efibootmgr || error "Base system installation failed"
+partition_disk() {
+    {
+        echo -e "o\nn\n\n\n+$ROOT_SIZE\nn\n\n\n+$SWAP_SIZE\nn\n\n\n+$EFI_SIZE\nt\n3\n1\nw" | fdisk $TARGET_DISK
+        mkfs.ext4 ${TARGET_DISK}1
+        mkswap ${TARGET_DISK}2
+        mkfs.fat -F32 ${TARGET_DISK}3
+    } | show_progress "Partitioning" "Creating partitions..."
+}
 
-info "Generating fstab..."
-genfstab -U /mnt >> /mnt/etc/fstab || error "Failed to generate fstab"
+install_base() {
+    mount ${TARGET_DISK}1 /mnt
+    mkdir -p /mnt/boot
+    mount ${TARGET_DISK}3 /mnt/boot
+    swapon ${TARGET_DISK}2
+    
+    pacstrap /mnt base linux linux-firmware | show_progress "Installing" "Installing base system..."
+    genfstab -U /mnt > /mnt/etc/fstab
+}
 
-# ===== PHASE 3: SYSTEM CONFIGURATION =====
-info "Configuring system..."
-arch-chroot /mnt /bin/bash <<EOF
-    # Time and locale
-    ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime || exit 1
-    hwclock --systohc || warn "Hardware clock sync failed"
-    sed -i "s/#${LOCALE}/${LOCALE}/" /etc/locale.gen || exit 1
-    locale-gen || exit 1
-    echo "LANG=${LOCALE}" > /etc/locale.conf || exit 1
-    echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf || exit 1
-
-    # Network
-    echo "${HOSTNAME}" > /etc/hostname || exit 1
-    systemctl enable NetworkManager || warn "Failed to enable NetworkManager"
-
-    # Users
-    echo "root:${ROOT_PASSWORD}" | chpasswd || exit 1
-    useradd -m -G wheel,audio,video,storage -s /bin/bash ${USERNAME} || exit 1
-    echo "${USERNAME}:${USER_PASSWORD}" | chpasswd || exit 1
-    sed -i 's/# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || exit 1
-
-    # Bootloader
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || exit 1
-    grub-mkconfig -o /boot/grub/grub.cfg || exit 1
+configure_system() {
+    arch-chroot /mnt <<EOF
+    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+    hwclock --systohc
+    echo "LANG=$LOCALE" > /etc/locale.conf
+    echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+    echo "$HOSTNAME" > /etc/hostname
+    useradd -m -G wheel $USERNAME
+    echo "root:$ROOT_PASSWORD" | chpasswd
+    echo "$USERNAME:$USER_PASSWORD" | chpasswd
+    systemctl enable NetworkManager
 EOF
+}
 
-# ===== PHASE 4: DESKTOP ENVIRONMENT =====
-info "Installing KDE Plasma..."
-arch-chroot /mnt /bin/bash <<EOF
-    pacman -S --noconfirm xorg plasma plasma-wayland-session kde-applications || exit 1
-    pacman -S --noconfirm pipewire pipewire-pulse wireplumber alsa-utils pavucontrol || warn "Audio setup failed"
-    pacman -S --noconfirm bluez bluez-utils cups htop neofetch || warn "Utility installation failed"
-    systemctl enable sddm || warn "Failed to enable SDDM"
-    systemctl enable bluetooth || warn "Failed to enable Bluetooth"
-    systemctl enable cups || warn "Failed to enable printing"
+install_gui() {
+    arch-chroot /mnt <<EOF
+    pacman -S --noconfirm xorg plasma plasma-wayland-session kde-applications
+    systemctl enable sddm
 EOF
+}
 
-# ===== PHASE 5: POST-INSTALL =====
-info "Installation complete!"
-echo -e "${GREEN}
-Arch Linux has been successfully installed!
+# -----------------------------------------------------------------------------
+# MAIN FLOW
+# -----------------------------------------------------------------------------
 
-Next steps:
-1. Type 'reboot' to restart your system
-2. Remove the installation media
-3. Log in to KDE Plasma as ${USERNAME}
-4. Run 'neofetch' to verify your installation
-
-Remember to change your passwords!
-${NC}"
+# Initialize TUI
+while true; do
+    show_main_menu
+    case $(cat /tmp/choice) in
+        1)
+            show_disk_selection
+            HOSTNAME=$(dialog --inputbox "Enter hostname:" 8 50 2>&1)
+            USERNAME=$(dialog --inputbox "Enter username:" 8 50 2>&1)
+            ROOT_PASSWORD=$(show_password_dialog "Root Password")
+            USER_PASSWORD=$(show_password_dialog "User Password")
+            TIMEZONE=$(tzselect)
+            
+            partition_disk
+            install_base
+            configure_system
+            install_gui
+            
+            dialog --msgbox "Installation complete! Reboot now." 8 50
+            exit 0
+            ;;
+        2)
+            cfdisk $TARGET_DISK
+            ;;
+        3)
+            nano /mnt/etc/fstab
+            ;;
+        4)
+            exit 0
+            ;;
+    esac
+done
